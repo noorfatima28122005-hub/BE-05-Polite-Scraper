@@ -1,93 +1,63 @@
 import time
+from pathlib import Path
+
 import requests
-from bs4 import BeautifulSoup
-from pydantic import BaseModel
-
-
-class Book(BaseModel):
-    title: str
-    price: str
-    availability: str
 
 
 BASE_URL = "https://books.toscrape.com/"
-DELAY = 1
+CACHE_DIR = Path("cache")
+CACHE_FILE = CACHE_DIR / "catalogue-page-1.html"
+
+USER_AGENT = (
+    "FlyRankInternshipA9/1.0 "
+    "(https://github.com/noorfatima28122005-hub/BE-05-Polite-Scraper)"
+)
+
+TIMEOUT = 10
 
 
-def scrape_page(url):
+def fetch_catalogue_page():
+    # Use cached HTML during development
+    if CACHE_FILE.exists():
+        content = CACHE_FILE.read_text(encoding="utf-8")
+
+        print("CACHE HIT")
+        print(f"Response size: {len(content)} bytes")
+
+        return content
+
+    print("FETCH")
+
+    headers = {
+        "User-Agent": USER_AGENT
+    }
+
     response = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=10
+        BASE_URL,
+        headers=headers,
+        timeout=TIMEOUT
     )
 
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    books = []
-
-    for item in soup.select("article.product_pod"):
-        title = item.h3.a.get("title", "")
-
-        price = item.select_one(".price_color").get_text(strip=True)
-        price = price.replace("Â£", "£")
-
-        availability = item.select_one(
-            ".availability"
-        ).get_text(" ", strip=True)
-
-        book = Book(
-            title=title,
-            price=price,
-            availability=availability
+    # Only HTTP 200 is accepted
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Fetch failed with status code {response.status_code}"
         )
 
-        books.append(book)
+    content = response.text
 
-    return books, soup
+    # Save the downloaded HTML as cache
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    CACHE_FILE.write_text(
+        content,
+        encoding="utf-8"
+    )
 
-def scrape_all_books():
-    all_books = []
-    page_number = 1
-    url = BASE_URL
+    print(f"Response size: {len(content)} bytes")
 
-    while url:
-        print(f"Scraping page {page_number}...")
-
-        try:
-            books, soup = scrape_page(url)
-            all_books.extend(books)
-
-            next_button = soup.select_one("li.next a")
-
-            if next_button:
-                next_url = next_button.get("href")
-
-                if next_url.startswith("catalogue/"):
-                    url = BASE_URL + next_url
-                else:
-                    url = BASE_URL + "catalogue/" + next_url
-
-                page_number += 1
-
-                time.sleep(DELAY)
-
-            else:
-                url = None
-
-        except requests.RequestException as error:
-            print(f"Request error: {error}")
-            break
-
-    return all_books
+    return content
 
 
 if __name__ == "__main__":
-    books = scrape_all_books()
-
-    for book in books[:20]:
-        print(book.model_dump())
-
-    print(f"\nTotal books scraped: {len(books)}")
+    fetch_catalogue_page()
