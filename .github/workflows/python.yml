@@ -25,4 +25,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run scraper
-        run: python -m scraper
+        run: python scraper/main.py
