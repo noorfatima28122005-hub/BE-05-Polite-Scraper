@@ -1,14 +1,16 @@
+import json
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError
 
 
 BASE_URL = "https://books.toscrape.com/"
 CACHE_DIR = Path("cache")
+OUTPUT_DIR = Path("output")
 
 USER_AGENT = (
     "FlyRankInternshipA9/1.0 "
@@ -19,32 +21,43 @@ TIMEOUT = 10
 DELAY = 1
 
 
-def get_cache_file(name):
-    return CACHE_DIR / name
+class Book(BaseModel):
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: str | None
+    source_page: str
+    fetched_at: str
 
 
-def fetch_page(url, cache_file):
-    cache_path = get_cache_file(cache_file)
+def get_cache_file(page_number):
+    return CACHE_DIR / f"catalogue-page-{page_number}.html"
 
-    # Use cached HTML during development
-    if cache_path.exists():
-        content = cache_path.read_text(encoding="utf-8")
-        print(f"CACHE HIT: {cache_file}")
+
+def get_book_cache_file(url):
+    book_name = url.rstrip("/").split("/")[-2]
+    return CACHE_DIR / f"book-{book_name}.html"
+
+
+def fetch_page(url, cache_file, label):
+    if cache_file.exists():
+        content = cache_file.read_text(encoding="utf-8")
+
+        print(f"CACHE HIT: {label}")
+
         return content
 
     print(f"FETCH: {url}")
 
-    headers = {
-        "User-Agent": USER_AGENT
-    }
-
     response = requests.get(
         url,
-        headers=headers,
+        headers={"User-Agent": USER_AGENT},
         timeout=TIMEOUT
     )
 
-    # Only HTTP 200 is accepted
     if response.status_code != 200:
         raise RuntimeError(
             f"Fetch failed with status code {response.status_code}"
@@ -54,12 +67,12 @@ def fetch_page(url, cache_file):
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    cache_path.write_text(
+    cache_file.write_text(
         content,
         encoding="utf-8"
     )
 
-    print(f"Response size: {len(content)} bytes")
+    time.sleep(DELAY)
 
     return content
 
@@ -74,64 +87,34 @@ def discover_books():
 
         print(f"\nProcessing catalogue page {catalogue_pages}...")
 
-        cache_file = f"catalogue-page-{catalogue_pages}.html"
-
         html = fetch_page(
             current_url,
-            cache_file
+            get_cache_file(catalogue_pages),
+            f"catalogue-page-{catalogue_pages}.html"
         )
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
+        soup = BeautifulSoup(html, "html.parser")
 
-        # Find every book link on this catalogue page
-        for link in soup.select(
-            "article.product_pod h3 a"
-        ):
+        for link in soup.select("article.product_pod h3 a"):
             href = link.get("href")
 
             if href:
-                absolute_url = urljoin(
-                    current_url,
-                    href
-                )
+                absolute_url = urljoin(current_url, href)
+                all_urls.append(absolute_url)
 
-                all_urls.append(
-                    absolute_url
-                )
-
-        # Find catalogue's next link
-        next_link = soup.select_one(
-            "li.next a"
-        )
+        next_link = soup.select_one("li.next a")
 
         if next_link:
             next_href = next_link.get("href")
 
             if next_href:
-                current_url = urljoin(
-                    current_url,
-                    next_href
-                )
-
-                # Wait before a real request
-                next_cache = get_cache_file(
-                    f"catalogue-page-{catalogue_pages + 1}.html"
-                )
-
-                if not next_cache.exists():
-                    time.sleep(DELAY)
+                current_url = urljoin(current_url, next_href)
             else:
                 current_url = None
         else:
             current_url = None
 
-    # Remove duplicate URLs
-    unique_urls = list(
-        dict.fromkeys(all_urls)
-    )
+    unique_urls = list(dict.fromkeys(all_urls))
 
     print("\n--- Stage 2 Result ---")
     print(f"catalogue_pages={catalogue_pages}")
@@ -141,124 +124,100 @@ def discover_books():
     return unique_urls
 
 
-def extract_book_details(
-    product_url,
-    source_page
-):
-    # Create a safe cache filename from the book URL
-    book_slug = product_url.rstrip("/").split("/")[-2]
-
-    cache_file = (
-        f"book-{book_slug}.html"
+def normalize_price(price_text):
+    clean_price = (
+        price_text
+        .replace("Â£", "")
+        .replace("£", "")
+        .strip()
     )
+
+    return float(clean_price)
+
+
+def extract_book(url, source_page):
+    cache_file = get_book_cache_file(url)
 
     html = fetch_page(
-        product_url,
-        cache_file
+        url,
+        cache_file,
+        f"book-{url.rstrip('/').split('/')[-2]}.html"
     )
 
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
+    soup = BeautifulSoup(html, "html.parser")
 
-    product_main = soup.select_one(
-        "article.product_page"
-    )
+    product_main = soup.select_one("article.product_page")
 
     if product_main is None:
-        raise ValueError(
-            "Product area not found"
-        )
+        raise ValueError("Product area not found")
 
-    # Title
-    title_element = product_main.select_one(
-        "div.product_main h1"
-    )
+    title_element = product_main.select_one("div.product_main h1")
+    price_element = product_main.select_one(".price_color")
+    availability_element = product_main.select_one(".availability")
+    rating_element = product_main.select_one("p.star-rating")
 
-    title = (
-        title_element.get_text(
-            " ",
-            strip=True
-        )
-        if title_element
-        else ""
-    )
+    if title_element is None:
+        raise ValueError("Title not found")
 
-    # Price
-    price_element = product_main.select_one(
-        "p.price_color"
-    )
+    if price_element is None:
+        raise ValueError("Price not found")
 
-    price_text = (
-        price_element.get_text(
-            " ",
-            strip=True
-        )
-        if price_element
-        else ""
-    )
+    if availability_element is None:
+        raise ValueError("Availability not found")
 
-    # Availability
-    availability_element = (
-        product_main.select_one(
-            "p.instock.availability"
-        )
-    )
+    title = title_element.get_text(" ", strip=True)
 
-    availability_text = (
-        availability_element.get_text(
-            " ",
-            strip=True
-        )
-        if availability_element
-        else ""
-    )
+    price_text = price_element.get_text(strip=True)
 
-    # Rating
-    rating_element = product_main.select_one(
-        "p.star-rating"
+    availability_text = availability_element.get_text(
+        " ",
+        strip=True
     )
 
     rating_text = ""
 
     if rating_element:
-        classes = rating_element.get(
-            "class",
-            []
-        )
+        classes = rating_element.get("class", [])
 
-        rating_classes = [
-            item
-            for item in classes
-            if item != "star-rating"
-        ]
+        for rating in [
+            "One",
+            "Two",
+            "Three",
+            "Four",
+            "Five"
+        ]:
+            if rating in classes:
+                rating_text = rating
+                break
 
-        if rating_classes:
-            rating_text = rating_classes[0]
+    description = None
 
-    # Description
-    description_element = soup.select_one(
-        "#product_description + p"
+    description_heading = soup.find(
+        "div",
+        id="product_description"
     )
 
-    if description_element:
-        description = description_element.get_text(
-            " ",
-            strip=True
+    if description_heading:
+        description_paragraph = (
+            description_heading.find_next_sibling("p")
         )
-    else:
-        description = None
 
-    # Fetch timestamp
-    fetched_at = datetime.now(
-        timezone.utc
-    ).isoformat()
+        if description_paragraph:
+            description = description_paragraph.get_text(
+                " ",
+                strip=True
+            )
+
+    fetched_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+        time.gmtime()
+    )
 
     return {
         "title": title,
-        "product_url": product_url,
+        "product_url": url,
         "price_text": price_text,
+        "price_gbp": normalize_price(price_text),
         "availability_text": availability_text,
         "rating_text": rating_text,
         "description": description,
@@ -267,57 +226,83 @@ def extract_book_details(
     }
 
 
-def scrape_book_details():
-    unique_urls = discover_books()
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    records = []
-
-    for index, product_url in enumerate(
-        unique_urls,
-        start=1
-    ):
-        print(
-            f"\nBook {index}/{len(unique_urls)}"
+    with path.open(
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            data,
+            file,
+            indent=2,
+            ensure_ascii=False
         )
 
+
+def main():
+    urls = discover_books()
+
+    valid_books = []
+    errors = []
+
+    source_page = BASE_URL
+
+    print("\n--- Stage 4: Extract and Validate ---")
+
+    for index, url in enumerate(urls, start=1):
+        print(f"\nBook {index}/{len(urls)}")
+
         try:
-            record = extract_book_details(
-                product_url=product_url,
-                source_page=BASE_URL
+            raw_book = extract_book(
+                url,
+                source_page
             )
 
-            records.append(record)
+            validated_book = Book.model_validate(
+                raw_book
+            )
 
-            # Wait before next real request
-            if index < len(unique_urls):
-                next_cache = get_cache_file(
-                    f"book-{unique_urls[index].rstrip('/').split('/')[-2]}.html"
-                )
+            valid_books.append(
+                validated_book.model_dump()
+            )
 
-                if not next_cache.exists():
-                    time.sleep(DELAY)
-
-        except requests.RequestException as error:
-            print(
-                f"Request error: {error}"
+        except ValidationError as error:
+            errors.append(
+                {
+                    "product_url": url,
+                    "error": str(error)
+                }
             )
 
         except Exception as error:
-            print(
-                f"Extraction error: {error}"
+            errors.append(
+                {
+                    "product_url": url,
+                    "error": str(error)
+                }
             )
 
-    print("\n--- Stage 3 Result ---")
-    print(
-        f"detail_pages={len(records)}"
+    books_path = OUTPUT_DIR / "books.json"
+    errors_path = OUTPUT_DIR / "errors.json"
+
+    save_json(
+        books_path,
+        valid_books
     )
 
-    if records:
-        print("\n--- Sample Raw Record ---")
-        print(records[0])
+    save_json(
+        errors_path,
+        errors
+    )
 
-    return records
+    print("\n--- Stage 4 Result ---")
+    print(f"valid_records={len(valid_books)}")
+    print(f"invalid_records={len(errors)}")
+    print(f"books.json records={len(valid_books)}")
+    print(f"errors.json records={len(errors)}")
 
 
 if __name__ == "__main__":
-    scrape_book_details()
+    main()
